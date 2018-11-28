@@ -1,16 +1,77 @@
+#' Create a portfolio names
+#' 
+#' @param stock_wt Weights of stocks in portfolio decimal.
+#'
+#' @return character string "PortxSyB" where x is stock weight and y is bond weight
+#'
+#' @examples get_port_name(0.1)
+get_port_name <- function(stock_wt){
+    paste0("Port", round(stock_wt*100,0), "S", round(100-stock_wt*100,0), "B")
+}
+
+get_pgp_name <- function(pgp_wt){
+    paste0("PGP", round(pgp_wt*100,0), "_Bond", round(100-pgp_wt*100,0))
+}
+add_port_returns_and_prices <- function(pgp){
+    stock_wts <- pgp$params$stockwts
+    data <- pgp$data
+    for(i in stock_wts){
+        data[,get_port_name(i)] <- i * data$RiskyRet + (1-i) * data$Bonds
+    }
+    # Create Price series (growth of 1) for all columns except date
+    for(i in colnames(data)[!(colnames(data) %in% "Date")]){
+        data[,paste0(i,"Px")] <- cumprod(1+data[,i])
+    }
+    data<-rbind(data[1,],data) # add a row at top; contents will be replaced
+    data[1,"Date"] <- format(as.Date(ISOdate(year(data$Date[1]),month(data$Date[1]),1))-1, "%Y-%m-%d")
+    data[1,2:(ncol(data)/2+1)] <- NA
+    data[1,(ncol(data)/2+2):ncol(data)] <- 1
+    pgp$data <- data
+    return(pgp)
+}
+
+add_pgp_returns <- function(pgp){
+    pgp_wts <- pgp$params$pgpwts
+    data <- pgp$data
+    for(i in pgp_wts){
+        data[,get_pgp_name(i)] <- i * data$Net.ret + (1-i) * data$Bonds
+    }
+    pgp$data<-data
+    return(pgp)
+}
+
 #' Set Parameters of PGP object
 #'
-#' @param pgp 
-#' @param width Number of prices in moving average
-#' @param commission Commission rate in percent.
 #'
-#' @return pgp object
+#' @return pgp object with list named params. Should contain at least width and commission
 #' @export
 #'
 #' @examples set_params(pgp,11,0.1)
-set_params<-function(pgp,width,commission){
-    pgp$width<-width
-    pgp$commission<-commission
+set_params<-function(pgp, ...){
+    params <- list(...)
+    if(!("width" %in% names(params))){
+        params$width <- 12
+        warning("width parameter missing. Setting to 12.")
+    } 
+    if(!("commission" %in% names(params))) {
+        params$commission <- 0
+        warning("commission parameter missing. Setting to 0.")
+    }
+    if(!("stockwts" %in% names(params))) {
+        params$portwts <- seq(0,1,.01)
+        warning("stockwts parameter missing. Setting to 0% to 100% by 10%.")
+    }
+    if(!("pgpwts" %in% names(params))) {
+        params$pgpwts <- c(1, 0.8, 0.6, 0.5, 0.4)
+        warning("pgpwts parameter missing. Setting to c(1, 0.8, 0.6, 0.5, 0.4).")
+    }
+    if(!("frequency" %in% names(params))) {
+        params$frequency <- "monthly"
+        warning("frequency parameter missing. Setting to monthly.")
+    }
+    pgp$params <- params
+    # pgp$width<-width
+    # pgp$commission<-commission
     return(pgp)
 }
 
@@ -18,7 +79,15 @@ set_params<-function(pgp,width,commission){
 #' 
 #' Runs a backtest on the data.
 #'
-#' @param pgp A pgp object
+#' @param pgp A pgp object which contains:
+#'  data: a tibble with the monthly returns for raw data and portfolios, and PX values 
+#'  frequency: monthly or daily
+#'  width: 12 window of pgp
+#'  commission for pgp trades e.g. 0.1 for 0.1%
+#'  returns: monthly returns for pgp has lag
+#'  legs: used for tax analysis
+#'  g1d grows of $1, same periods as returns
+#'  risky_dates for shading charts
 #'
 #' @return pgp updated pgp with results
 #' @export
@@ -27,15 +96,17 @@ set_params<-function(pgp,width,commission){
 pgp_backtest<-function(pgp){
     library(lubridate)
     library(xts)
+    pgp<-add_port_returns_and_prices(pgp)
     pgp<-avg_px(pgp)
     pgp<-signal(pgp)
     pgp<-period_returns(pgp)
-    returns<-pgp$data[complete.cases(pgp$data),c("RiskyRet","SafeRet","Gross.ret","Net.ret")]
-    d<-rownames(returns)
-    d<-as.Date(as.yearmon(format(d),"%b %Y"))
-    d<-d+days(days_in_month(d)-1)
-    rownames(returns)<-as.Date(d)
-    returns<-xts(returns,order.by = d)
+    pgp<-add_pgp_returns(pgp)
+    # returns<-pgp$data[,c("Date","RiskyRet","SafeRet","Gross.ret","Net.ret")]
+    returns<-pgp$data[, c("Date", "RiskyRet", "SafeRet", "Gross.ret", "Net.ret", 
+                          names(pgp$data)[substr(names(pgp$data),1,4) %in% "Port"],
+                          names(pgp$data)[substr(names(pgp$data),1,3) %in% "PGP"])]
+    returns<-returns[complete.cases(returns),]
+    #returns<-xts(data.frame(returns),order.by = returns$Date)
     pgp$returns<-returns
     pgp$legs<-analyze_legs(pgp)
     pgp$g1d <- pgp_g1d(pgp) 
@@ -51,11 +122,8 @@ pgp_backtest<-function(pgp){
 #'
 #' @examples avg_px(pgp)
 avg_px<-function(pgp){
-    library(zoo)
-    out<-pgp
-    temp<-rollmean(pgp$data$RiskyPx,k=pgp$width,fill=NA,align="right")
-    out$data$AvgPx<-temp
-    return(out)
+    pgp$data$AvgPx<-rollmean(pgp$data$RiskyRetPx,k=pgp$params$width,fill=NA,align="right")
+    return(pgp)
 }
 
 #' Signal - Adds signal to pgp object.
@@ -70,7 +138,7 @@ avg_px<-function(pgp){
 #' 
 #' @examples signal(pgp)
 signal<-function(pgp){
-    pgp$data$Signal<-pgp$data$RiskyPx>=pgp$data$AvgPx
+    pgp$data$Signal<-pgp$data$RiskyRetPx>=pgp$data$AvgPx
     return(pgp)
 }
 
@@ -91,8 +159,8 @@ period_returns<-function(pgp){
     pgp$data$Gross.ret<-temp
     signal.lag2<-c(NA,NA,pgp$data$Signal[1:(nrow(pgp$data)-2)])
     pgp$data$Trade<-signal.lag!=signal.lag2
-    pgp$data$Trade[pgp$width+1]<-FALSE
-    pgp$data$Net.ret<-pgp$data$Gross.ret - pgp$data$Trade*pgp$commission/100
+    pgp$data$Trade[pgp$params$width+1]<-FALSE
+    pgp$data$Net.ret<-pgp$data$Gross.ret - pgp$data$Trade*pgp$params$commission/100
     return(pgp)
 }
 
@@ -115,22 +183,24 @@ period_returns<-function(pgp){
 #'   
 #' @examples analyze_legs(pgp)
 analyze_legs<-function(pgp){
-    pi1y<-switch(pgp$frequency,monthly="12",daily=252)
-    data<-pgp$data[complete.cases(pgp$data),]
-    legs<-data.frame(Start=character(),End=character(),Periods=numeric(),Type=character(),Gross.ret=numeric(),
+    pi1y<-switch(pgp$params$frequency,monthly="12",daily=252)
+    data<-pgp$data[complete.cases(pgp$data$Trade),]
+    legs<-data.frame(Start=as.Date(character()),End=as.Date(character()),Periods=numeric(),Type=character(),Gross.ret=numeric(),
                      Net.ret=numeric())
     out<-list()
     legs.cnt<-1
-    legs[legs.cnt,"Start"]<-rownames(data)[1]
+    legs[legs.cnt,"Start"]<-data[1, "Date"]
     legs[legs.cnt,"Gross.ret"]<-1
     legs[legs.cnt,"Net.ret"]<-1
     legs[legs.cnt,"Type"]<-ifelse(data[1,"Signal"],"Risky","Safe")
     legs[legs.cnt,"Periods"]<-0
     for (i in 1:nrow(data)){
-        if (data[i,"Trade"]){ 
-            legs[legs.cnt,"End"]<-rownames(data)[i-1]
+        if(as.logical(data[i,"Trade"])){ 
+            #legs[legs.cnt,"End"]<-rownames(data)[i-1]
+            legs[legs.cnt,"End"]<-data$Date[i-1]
             legs.cnt<-legs.cnt+1
-            legs[legs.cnt,"Start"]<-rownames(data)[i]
+            #legs[legs.cnt,"Start"]<-rownames(data)[i]
+            legs[legs.cnt,"Start"]<-data$Date[i]
             legs[legs.cnt,"Gross.ret"]<-1+data[i,"Gross.ret"]
             legs[legs.cnt,"Net.ret"]<-1+data[i,"Net.ret"]
             legs[legs.cnt,"Type"]<-ifelse(data[i-1,"Signal"],"Risky","Safe")
@@ -141,7 +211,7 @@ analyze_legs<-function(pgp){
             legs[legs.cnt,"Periods"]<-legs[legs.cnt,"Periods"]+1
         }
     }
-    legs[legs.cnt,"End"]<-rownames(data)[nrow(data)]
+    legs[legs.cnt,"End"]<-data$Date[nrow(data)]
     legs.summary<-data.frame(NumLegs=numeric(5),NumPeriods=numeric(5),Gross.cumret=numeric(5),Net.cumret=numeric(5))
     rownames(legs.summary)<-c("LT Gains","LT Losses","ST Gains","ST Losses","Safe")
     idx <- legs$Type=="Risky" & legs$Periods>=pi1y & legs$Gross.ret>=1
@@ -175,13 +245,11 @@ analyze_legs<-function(pgp){
 }
 
 pgp_g1d <- function(pgp){
-    d1 <- index(pgp$returns)[1] %m-% months(1)
-    x <- apply(1+pgp$returns,2,cumprod)
+    d1 <- pgp$returns[1, "Date", drop=TRUE] %m-% months(1)
+    x <- apply(1+pgp$returns[,!(colnames(pgp$returns) %in% "Date")], 2, cumprod)
     x <- rbind(1,x)
-    rownames(x)[1]<-as.character(d1)
-    dts <- rownames(x)
     x <- tibble::as.tibble(x)
-    x$Date <- as.Date(dts,"%Y-%m-%d")
+    x <- cbind(Date=c(d1, pgp$returns$Date), x)
     return(x)
 }
 
@@ -224,7 +292,7 @@ pgp_backtest2<-function(pgp){
 }
 
 analyze_legs2<-function(pgp){
-    pi1y<-switch(pgp$frequency,monthly="12",daily=252)
+    pi1y<-switch(pgp$params$frequency,monthly="12",daily=252)
     cnames<-c("Date", "RiskyRet","SafeRet","Gross.ret","Net.ret", "BalRet", "AvgPx", "Signal", "Trade",
               "RiskyPx", "SafePx", "BalPx")
     data<-pgp$data[complete.cases(pgp$data[,cnames]),cnames]
@@ -380,3 +448,4 @@ create_boxplot_plotly <- function(tbl_roll){
     return(p)
 }    
 # end plotly related functions
+
